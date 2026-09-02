@@ -1,0 +1,7 @@
+# --- Voice / Silero ---
+torch>=2.0.0
+omegaconf>=2.3.0
+# optional better search:
+duckduckgo-search>=6.0.0
+# optional audio device list:
+# PyAudio  (pip install pipwin && pipwin install pyaudio  на Windows)
