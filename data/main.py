@@ -204,8 +204,9 @@ async def main():
             app.quit()
         except Exception:
             pass
-        print("✅ Ассистент остановлен (процесс должен завершиться)")
-
+        print("✅ Ассистент остановлен")
+        # sys уже импортирован на уровне модуля — не делать import sys здесь
+        # (иначе UnboundLocalError на sys.argv в начале main)
 
 if __name__ == "__main__":
     try:
@@ -217,3 +218,9 @@ if __name__ == "__main__":
         import traceback
         traceback.print_exc()
         input("Нажмите Enter для выхода...")
+    finally:
+        # Гарантия: не оставлять python.exe с залоченным apps.db
+        try:
+            print("[DEBUG] process exit", flush=True)
+        except Exception:
+            pass

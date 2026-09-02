@@ -106,10 +106,12 @@ LLM_TIMEOUT = 300
 LLM_SOCK_READ_TIMEOUT = 300
 API_KEY = "not-needed"
 MODEL_NAME = "qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive"
-FAST_MODEL = "qwen3-vl-8b-instruct-abliterated-v2.0"
+FAST_MODEL = "qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive"
 
 TEMPERATURE = 0.4
 MAX_TOKENS = 1000
+DETAIL_MAX_TOKENS = 4000  # когда хозяин просит подробно/раскрыто
+THINKING_MODE = "auto"  # auto | on | off — enable_thinking для Qwen3/LM Studio
 CHAT_HISTORY_TURNS = 6
 CHAT_HISTORY_CHARS = 360
 CHAT_USER_CHARS = 800
@@ -359,7 +361,7 @@ SCREEN_VISION_AUTO = False
 SCREEN_ALLOWED_MONITORS = None  # None = все; иначе [0, 1] слева направо
 SCREEN_VISION_AUTO_INTERVAL = 60
 SCREEN_VISION_MAX_SIDE = 1600
-SCREEN_VISION_MODEL = "qwen3-vl-8b-instruct-abliterated-v2.0"
+SCREEN_VISION_MODEL = "qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive"
 SCREEN_OCR_ENABLED = True
 SCREEN_OCR_ENGINE = "auto"       # auto | rapidocr | tesseract | easyocr
 SCREEN_OCR_LANG = "rus+eng"      # tesseract: rus+eng
@@ -374,6 +376,7 @@ SEARCH_ENGINE = "google"
 SEARCH_SAFE_MODE = "off"
 SEARCH_NUM_RESULTS = 10
 SEARCH_CACHE_TTL = 3600
+SEARCH_OPEN_BEST_RESULT = True  # вторая вкладка с лучшим результатом
 SEARCH_OPEN_BROWSER = True
 USE_ASSISTANT_BROWSER = False
 

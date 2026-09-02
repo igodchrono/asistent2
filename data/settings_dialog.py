@@ -309,6 +309,13 @@ class SettingsDialog(
                 "GREETING_NSFW_CHANCE": self.greeting_nsfw_slider.value() / 100.0,
             }
 
+            # Модель из «Основных» = и чат, и vision (без автоподмены на 8B)
+            model_sel = (new_settings.get("MODEL_NAME") or "").strip()
+            if model_sel:
+                new_settings["MODEL_NAME"] = model_sel
+                new_settings["FAST_MODEL"] = model_sel
+                new_settings["SCREEN_VISION_MODEL"] = model_sel
+
             ok = save_user_settings(new_settings)
             if not ok:
                 raise RuntimeError("settings.json не записался")
@@ -398,16 +405,38 @@ class SettingsDialog(
             except Exception as _ae:
                 print(f"⚠️ apply_to_config: {_ae}")
 
-            if hasattr(self.parent, "assistant"):
-                assistant = self.parent.assistant
+            # Надёжно находим главное окно (self.parent может быть объектом или методом Qt)
+            host = None
+            try:
+                p = getattr(self, "parent", None)
+                if callable(p) and not isinstance(p, type):
+                    try:
+                        host = p()
+                    except TypeError:
+                        host = p if not callable(p) else None
+                elif p is not None and not callable(p):
+                    host = p
+            except Exception:
+                host = None
+            if host is None:
+                try:
+                    host = self.parent() if callable(getattr(self, "parent", None)) else None
+                except Exception:
+                    host = None
+            if host is None:
+                host = self.window()
+
+            assistant = getattr(host, "assistant", None) if host is not None else None
+            if assistant is not None:
                 assistant.api_url = new_settings["API_URL"]
                 assistant.api_key = new_settings["API_KEY"]
                 assistant.model_name = new_settings["MODEL_NAME"]
                 assistant.temperature = new_settings["TEMPERATURE"]
                 assistant.max_tokens = new_settings["MAX_TOKENS"]
+                print(f"🧠 Модель применена сразу: {assistant.model_name}")
 
-            if hasattr(self.parent, "avatar_window"):
-                avatar = self.parent.avatar_window
+            if host is not None and hasattr(host, "avatar_window") and host.avatar_window:
+                avatar = host.avatar_window
                 avatar.set_size(new_settings["AVATAR_SIZE"])
                 avatar.set_anim_speed(new_settings["ANIMATION_SPEED"])
                 if new_settings.get("SHOW_AVATAR", True):
@@ -418,26 +447,51 @@ class SettingsDialog(
                     avatar.hide()
 
             # Обновить voice controller на лету
-            if hasattr(self.parent, "voice_controller") and self.parent.voice_controller:
-                vc = self.parent.voice_controller
+            vc = getattr(host, "voice_controller", None) if host is not None else None
+            if vc:
                 if hasattr(vc, "apply_settings"):
                     vc.apply_settings()
                 else:
-                    vc.set_voice_params(
-                        voice=new_settings["VOICE_NAME"],
-                        rate=new_settings["VOICE_SPEED"],
-                        volume=new_settings["VOICE_VOLUME"],
-                    )
+                    try:
+                        vc.set_voice_params(
+                            voice=new_settings["VOICE_NAME"],
+                            rate=new_settings["VOICE_SPEED"],
+                            volume=new_settings["VOICE_VOLUME"],
+                        )
+                    except Exception:
+                        pass
 
+            # Интервалы авто-сообщений / автопросмотра — перезапуск потоков
             try:
-                host = self.parent if not callable(self.parent) else self.parent()
-                ast = getattr(host, "assistant", None)
-                lc = getattr(ast, "_lifecycle", None) or getattr(ast, "lifecycle", None)
-                if lc and hasattr(lc, "start"):
-                    lc.start()
+                lc = None
+                if assistant is not None:
+                    lc = getattr(assistant, "lifecycle", None) or getattr(assistant, "_lifecycle", None)
+                if lc is None and host is not None:
+                    lc = getattr(host, "lifecycle", None)
+                if lc is not None:
+                    if hasattr(lc, "restart_background"):
+                        lc.restart_background()
+                    elif hasattr(lc, "start"):
+                        try:
+                            lc.stop()
+                        except Exception:
+                            pass
+                        lc.start()
+                    print(
+                        "🔄 Lifecycle перезапущен: "
+                        f"greet={getattr(config,'GREETING_INTERVAL_MIN', '?')}-"
+                        f"{getattr(config,'GREETING_INTERVAL_MAX', '?')}с, "
+                        f"screen={getattr(config,'SCREEN_VISION_AUTO_INTERVAL', '?')}с"
+                    )
             except Exception as _le:
-                print("lifecycle after save:", _le)
-            QtWidgets.QMessageBox.information(self, "Успех", "Настройки сохранены!")
+                print(f"⚠️ lifecycle after save: {_le}")
+
+            QtWidgets.QMessageBox.information(
+                self,
+                "Успех",
+                "Настройки сохранены и применены сразу\n"
+                f"(модель: {new_settings.get('MODEL_NAME', '')})",
+            )
             self.accept()
 
         except Exception as e:

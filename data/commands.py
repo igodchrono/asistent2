@@ -144,8 +144,41 @@ class Cmd:
 
 def _strip_tail(s: str) -> str:
     s = (s or "").strip(" \t.!?…,")
-    s = re.sub(r"^(пожалуйста|плиз|мне|ка)\s+", "", s, flags=re.I)
+    s = re.sub(r"\s+", " ", s)
     return s.strip()
+
+
+def _clean_search_query(q: str) -> str:
+    """Убрать служебные «в интернете/в гугле» и хвосты действий из поискового запроса."""
+    s = _strip_tail(q or "")
+    if not s:
+        return ""
+    patterns = [
+        r"(?i)^(?:пожалуйста|плиз|пожалуйсто)[,\s]+",
+        r"(?i)^(?:мне|мне\s+нужно|нужно|надо)[,\s]+",
+        r"(?i)^(?:в\s+интернете|в\s+сети|в\s+гугле|в\s+google|в\s+яндексе|в\s+web|в\s+вебе|"
+        r"через\s+гугл|через\s+google|онлайн|в\s+поисковике)\s+",
+        r"(?i)\s+(?:в\s+интернете|в\s+сети|в\s+гугле|в\s+google|онлайн)\s*$",
+        r"(?i)^(?:информацию\s+о|инфу\s+о|про|о)\s+",
+        # хвосты составных команд: не должны попадать в Google
+        r"(?i)\s*(?:и\s+)?(?:потом\s+)?(?:сделай|сделать|сними|снять|сохрани)?\s*"
+        r"(?:скриншот|скрин|screenshot).*$",
+        r"(?i)\s*(?:и\s+)?(?:потом\s+)?(?:проанализир\w*|разбер\w*|прочитай|прочти|опиши)\s*"
+        r"(?:текст|экран|содержимое|что\s+там)?.*$",
+        r"(?i)\s*(?:и\s+)?(?:открой|открыть|запусти).*$",
+    ]
+    prev = None
+    while prev != s:
+        prev = s
+        for pat in patterns:
+            s = re.sub(pat, "", s).strip()
+        s = _strip_tail(s)
+    # «книгу про X» → «книга про X» чуть естественнее для поиска
+    s = re.sub(r"(?i)^книгу\s+", "книга ", s)
+    s = re.sub(r"(?i)^книжки\s+", "книга ", s)
+    return s
+
+
 
 
 def parse_user(text: str) -> Optional[Cmd]:
@@ -241,11 +274,25 @@ def parse_user(text: str) -> Optional[Cmd]:
             return Cmd("launch", key, anim="pointing")
         return None
 
+    # «открой/найди книгу про X» → поиск книги (нет локального файла)
+    m_book = re.search(
+        r"(?i)(?:открой|открыть|найд[иуёе]?|нади|поищи)\s+(?:мне\s+)?(?:книгу|книга|pdf)\s+(?:про|по|о)?\s*(.+)$",
+        t,
+    )
+    if m_book:
+        rest = _clean_search_query(m_book.group(1))
+        if rest:
+            q = rest if re.search(r"(?i)книг", rest) else f"книга {rest}"
+            q = _clean_search_query(q)
+            print(f"[DEBUG] parse BOOK SEARCH -> {q!r}", flush=True)
+            return Cmd("search", q, anim="searching")
+
     m = SEARCH_START.match(t)
     if m:
-        rest = _strip_tail(t[m.end():])
+        rest = _clean_search_query(t[m.end():])
         if not rest or rest.lower() in ("это", "то", "вот"):
             return None
+        print(f"[DEBUG] parse SEARCH -> {rest!r}", flush=True)
         return Cmd("search", rest, anim="searching")
 
     msoft = re.search(
@@ -253,7 +300,7 @@ def parse_user(text: str) -> Optional[Cmd]:
         t,
     )
     if msoft:
-        rest = _strip_tail(msoft.group(1))
+        rest = _clean_search_query(msoft.group(1))
         if rest and rest.lower() not in ("это", "то", "вот"):
             return Cmd("search", rest, anim="searching")
 
@@ -270,9 +317,55 @@ def parse_user(text: str) -> Optional[Cmd]:
                 q,
                 count=1,
             )
-            q = _strip_tail(q)
+            q = _clean_search_query(q)
             if q and len(q) >= 2:
                 return Cmd("search", q, anim="searching")
+
+    # Погода / «какая погода» / «погода в X»
+    m_w = re.search(
+        r"(?i)(?:какая\s+)?погод[аеуы]?\s*(?:сегодня|сейчас|завтра)?\s*(?:в\s+|для\s+)?(.+)?$",
+        t,
+    )
+    if re.search(r"(?i)\bпогод", t) and not re.search(r"(?i)настройк|экран", t):
+        place = ""
+        m_place = re.search(
+            r"(?i)погод\w*\s*(?:сегодня|сейчас|завтра)?\s*(?:в\s+|для\s+|по\s+)?(.+)$",
+            t,
+        )
+        if m_place and m_place.group(1):
+            place = _clean_search_query(m_place.group(1))
+            place = re.sub(r"(?i)^(сегодня|сейчас|завтра)\s*", "", place).strip()
+        if place:
+            if not re.match(r"(?i)^(в|во|для|по)\s", place):
+                place = f"в {place}"
+            q = f"погода {place}"
+        else:
+            q = "погода сегодня"
+        q = _clean_search_query(q)
+        print(f"[DEBUG] parse WEATHER -> {q!r}", flush=True)
+        return Cmd("search", q, anim="searching")
+
+    # «дай посмотрим X», «посмотрим X», «покажи про X» (не экран)
+    m_look = re.search(
+        r"(?i)(?:дай\s+)?(?:посмотрим|глянем|глянуть|посмотреть|посмотри)\s+(.+)$",
+        t,
+    )
+    if m_look and not re.search(r"(?i)экран|монитор|окно", t):
+        rest = _clean_search_query(m_look.group(1))
+        if rest and len(rest) >= 2:
+            print(f"[DEBUG] parse LOOKUP -> {rest!r}", flush=True)
+            return Cmd("search", rest, anim="searching")
+
+    m_show = re.search(
+        r"(?i)(?:покажи|скинь|найди\s+инфу|информация\s+о)\s+(.+)$",
+        t,
+    )
+    if m_show and not re.search(r"(?i)экран|монитор|настройк|окно", t):
+        rest = _clean_search_query(m_show.group(1))
+        if rest and len(rest) >= 2 and not IMG_HINT.search(t):
+            # «покажи картинки» already handled; plain «покажи X» = search
+            print(f"[DEBUG] parse SHOW -> {rest!r}", flush=True)
+            return Cmd("search", rest, anim="searching")
 
     low = t.lower()
     if re.search(r"(?i)(выключи|выключить)\s+(звук|музон)", low):
@@ -356,6 +449,56 @@ def _search_urls(q: str):
     return intent, search
 
 
+
+def _normalize_url_key(url: str) -> str:
+    u = (url or "").strip().lower()
+    u = u.split("#", 1)[0].split("?", 1)[0].rstrip("/")
+    if u.startswith("https://"):
+        u = u[8:]
+    elif u.startswith("http://"):
+        u = u[7:]
+    if u.startswith("www."):
+        u = u[4:]
+    return u
+
+
+def _is_url_blocked(url: str) -> bool:
+    """True если в памяти помечено «не открывать» эту ссылку."""
+    try:
+        from persistent_memory import PersistentMemory
+        import config as _cfg
+        from memory_scope import prompt_scopes
+        pm = PersistentMemory(getattr(_cfg, "PERSISTENT_MEMORY_DB", "persistent_memory.db"))
+        try:
+            key = _normalize_url_key(url)
+            if not key:
+                return False
+            rows = pm.list_all(scope=None, category=None, limit=500)
+            for r in rows:
+                cat = (r.get("category") or "").lower()
+                if cat not in ("blocked_url", "no_open", "ссылка", "link", "url"):
+                    # также ищем value с флагом no_open
+                    val = (r.get("value") or "").lower()
+                    if "no_open" not in val and "не откры" not in val and "blocked" not in val:
+                        continue
+                val = (r.get("value") or "")
+                k = (r.get("key") or "")
+                blob = f"{k} {val}".lower()
+                nk = _normalize_url_key(val) or _normalize_url_key(k)
+                if nk and (nk in key or key in nk):
+                    return True
+                if key and key in blob:
+                    return True
+            return False
+        finally:
+            try:
+                pm.close()
+            except Exception:
+                pass
+    except Exception as e:
+        logger.debug("block url check: %s", e)
+        return False
+
 def _open_url(url: str) -> bool:
     path = (getattr(config, "BROWSER_PATH", "") or "").strip()
     try:
@@ -372,17 +515,158 @@ def _open_url(url: str) -> bool:
         return False
 
 
+
+def _score_result(title: str, snippet: str, query: str) -> float:
+    q_words = [w for w in re.findall(r"\w+", (query or "").lower()) if len(w) > 2]
+    if not q_words:
+        return 0.0
+    blob = f"{title or ''} {snippet or ''}".lower()
+    hit = sum(1 for w in q_words if w in blob)
+    score = hit / max(len(q_words), 1)
+    # бонус за pdf/книгу если в запросе книга
+    if re.search(r"(?i)книг|pdf|учебник|гидравлик", query or ""):
+        if re.search(r"(?i)pdf|book|книга|учебник|lib|archive\.org|pdfdrive", blob):
+            score += 0.35
+        if re.search(r"(?i)\.pdf\b", blob):
+            score += 0.25
+    # штраф за мусор
+    if re.search(r"(?i)(login|sign in|cookie|captcha|advert)", blob):
+        score -= 0.3
+    return score
+
+
+def _fetch_ddg_results(q: str, limit: int = 8) -> list:
+    """Парсинг HTML DuckDuckGo (без API-ключа)."""
+    import requests
+    from html import unescape
+    results = []
+    try:
+        url = "https://html.duckduckgo.com/html/"
+        r = requests.post(
+            url,
+            data={"q": q},
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                )
+            },
+            timeout=12,
+        )
+        r.raise_for_status()
+        html = r.text
+        # result blocks
+        blocks = re.findall(
+            r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>'
+            r'.*?class="result__snippet"[^>]*>(.*?)</(?:a|td|div)',
+            html,
+            flags=re.I | re.S,
+        )
+        if not blocks:
+            # fallback: только ссылки result__a
+            blocks = [
+                (href, title, "")
+                for href, title in re.findall(
+                    r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
+                    html,
+                    flags=re.I | re.S,
+                )
+            ]
+        for href, title, snip in blocks:
+            href = unescape(href.strip())
+            # DDG redirect: //duckduckgo.com/l/?uddg=...
+            m = re.search(r"[?&]uddg=([^&]+)", href)
+            if m:
+                from urllib.parse import unquote
+                href = unquote(m.group(1))
+            if not href.startswith("http"):
+                continue
+            if "duckduckgo.com" in href and "uddg" not in href:
+                continue
+            title = re.sub(r"<[^>]+>", "", unescape(title)).strip()
+            snip = re.sub(r"<[^>]+>", "", unescape(snip)).strip()
+            results.append({"url": href, "title": title, "snippet": snip})
+            if len(results) >= limit:
+                break
+    except Exception as e:
+        logger.warning("ddg fetch: %s", e)
+    return results
+
+
+def _pick_best_result(q: str, results: list) -> dict | None:
+    if not results:
+        return None
+    ranked = sorted(
+        results,
+        key=lambda r: _score_result(r.get("title", ""), r.get("snippet", ""), q),
+        reverse=True,
+    )
+    best = ranked[0]
+    score = _score_result(best.get("title", ""), best.get("snippet", ""), q)
+    print(
+        f"[DEBUG] best result score={score:.2f} title={best.get('title')!r} url={best.get('url')!r}",
+        flush=True,
+    )
+    # если всё совсем мимо — всё равно берём первый из выдачи
+    return best
+
+
+def _search_open_best(q: str, search_page_url: str, intent: str) -> str:
+    """1) вкладка поиска  2) лучший результат второй вкладкой."""
+    open_search = bool(getattr(config, "SEARCH_OPEN_BROWSER", True))
+    open_best = bool(getattr(config, "SEARCH_OPEN_BEST_RESULT", True))
+    # картинки/видео — только страница поиска
+    if intent in ("images", "video"):
+        opened = _open_url(search_page_url) if open_search else False
+        if intent == "images":
+            return f"🔍 Поиск картинок: {q}" if opened else f"🔍 {search_page_url}"
+        return f"🔍 Поиск видео: {q}" if opened else f"🔍 {search_page_url}"
+
+    opened_search = False
+    if open_search:
+        opened_search = _open_url(search_page_url)
+
+    best_line = ""
+    if open_best and intent == "web":
+        results = _fetch_ddg_results(q, limit=8)
+        print(f"[DEBUG] ddg results: {len(results)}", flush=True)
+        best = _pick_best_result(q, results)
+        if best and best.get("url"):
+            # не открывать тот же URL что страница поиска
+            if best["url"].rstrip("/") != search_page_url.rstrip("/"):
+                ok = _open_url(best["url"])
+                title = (best.get("title") or "")[:80]
+                if ok:
+                    best_line = f" · лучшее: {title or best['url']}"
+                else:
+                    best_line = f" · не открылось: {best['url']}"
+            else:
+                best_line = " · лучший = страница поиска"
+        else:
+            best_line = " · подходящая ссылка не найдена"
+
+    if opened_search:
+        return f"🔍 Поиск: {q}{best_line}"
+    return f"🔍 {search_page_url}{best_line}"
+
 def _search(q: str) -> str:
     if not _net_ok():
         return "🌐 Поиск выключен"
-    q = (q or "").strip().strip("«»\"'")
+    q = _clean_search_query(q or "")
+    print(f"[DEBUG] search query -> {q!r}", flush=True)
     if len(q) < 2:
         return "⚠️ Пустой поиск"
+    # Прямая ссылка, которую просили не открывать
+    if q.startswith("http://") or q.startswith("https://"):
+        if _is_url_blocked(q):
+            return f"🔗 Ссылка в памяти как «не открывать»: {q}"
+        opened = _open_url(q) if getattr(config, "SEARCH_OPEN_BROWSER", True) else False
+        return f"🔗 {q}" if opened else f"🔗 (не открыто) {q}"
     intent, url = _search_urls(q)
-    opened = _open_url(url) if getattr(config, "SEARCH_OPEN_BROWSER", True) else False
-    if intent == "images":
-        return f"🔍 Поиск картинок: {q}" if opened else f"🔍 {url}"
-    return f"🔍 Поиск: {q}" if opened else f"🔍 {url}"
+    if _is_url_blocked(url):
+        return f"🔗 Не открываю (запомнено): {url}"
+    return _search_open_best(q, url, intent)
 
 
 def _pc(action: str) -> str:
@@ -597,6 +881,7 @@ def _close_app(name: str) -> str:
 
 
 def execute(cmd: Cmd) -> str:
+    print(f"[DEBUG] execute kind={cmd.kind!r} target={getattr(cmd, 'target', None)!r}", flush=True)
     if cmd.kind == "setting":
         return cmd.target
     if cmd.kind == "close":

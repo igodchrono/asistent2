@@ -797,15 +797,48 @@ class AssistantWindow(VoiceInputMixin, QtWidgets.QMainWindow):
         dialog.exec_()
 
     def closeEvent(self, event):
-        self.reminder_timer.stop()
+        print("[DEBUG] closeEvent: full shutdown...", flush=True)
+        try:
+            if hasattr(self, "reminder_timer") and self.reminder_timer:
+                self.reminder_timer.stop()
+        except Exception:
+            pass
         for w in getattr(self, "fullscreen_windows", []) or []:
             try:
                 w.close()
             except Exception:
                 pass
-        if hasattr(self, "assistant") and self.assistant:
-            try:
-                self.assistant.shutdown()
-            except Exception:
-                pass
+        # lifecycle + assistant + apps.db
+        try:
+            asst = getattr(self, "assistant", None)
+            if asst is not None:
+                lc = getattr(asst, "_lifecycle", None) or getattr(asst, "lifecycle", None)
+                if lc is not None and hasattr(lc, "stop"):
+                    lc.stop()
+                if hasattr(asst, "shutdown"):
+                    asst.shutdown()
+        except Exception as e:
+            print(f"[DEBUG] closeEvent shutdown: {e}", flush=True)
+        try:
+            lm = getattr(self, "lifecycle", None)
+            if lm is not None and hasattr(lm, "stop"):
+                lm.stop()
+        except Exception:
+            pass
         event.accept()
+        # Выход из Qt и asyncio-loop (иначе python.exe висит)
+        try:
+            from PyQt5 import QtWidgets, QtCore
+            app = QtWidgets.QApplication.instance()
+            if app is not None:
+                QtCore.QTimer.singleShot(100, app.quit)
+        except Exception:
+            pass
+        try:
+            import asyncio
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.call_soon_threadsafe(loop.stop)
+        except Exception:
+            pass
+        print("[DEBUG] closeEvent: quit scheduled", flush=True)

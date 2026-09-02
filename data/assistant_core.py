@@ -75,6 +75,24 @@ class LMAssistant:
     Настроение — ContextManager.
     """
 
+
+    _DETAIL_RE = re.compile(
+        r"(?i)("
+        r"подробн\w*|раскрыт\w*|разв[её]рнут\w*|максимальн\w*|"
+        r"детально|поподробнее|распиши|разжева\w*|с\s*подробност\w*|"
+        r"длинн\w*\s*ответ|не\s*кратко|не\s*коротко|"
+        r"as\s*detailed|in\s*detail|elaborate|comprehensive|thoroughly|"
+        r"full\s*answer|long\s*form"
+        r")"
+    )
+
+    def _wants_detailed(self, text: str) -> bool:
+        """Хозяин просит развёрнутый ответ — не ужимать в 1–2 фразы."""
+        if not text:
+            return False
+        return bool(self._DETAIL_RE.search(text))
+
+
     def __init__(self):
         self.api_url = config.API_URL
         self.api_key = config.API_KEY
@@ -119,6 +137,7 @@ class LMAssistant:
 
         # Состояние
         self.conversation_history: List[Dict] = []
+        self._pending_action: Optional[Dict[str, Any]] = None  # {type, params, summary}
         self._lock = asyncio.Lock()
         self._initialized = False
         self._background_tasks = []
@@ -404,7 +423,42 @@ class LMAssistant:
         async with self._lock:
             self.conversation_history.append({"role": "user", "content": user_message})
             self.memory.add_message("user", user_message, character=active_character())
+        print(f"[DEBUG] user: {user_message[:200]!r}", flush=True)
+        self._remember_blocked_url_from_user(user_message)
         self._maybe_store_user_facts(user_message)
+
+        # «да / давай» после «могу найти / открыть» → выполнить pending
+        try:
+            pend_reply = await self._try_execute_pending_affirmation(user_message)
+            if pend_reply:
+                yield pend_reply
+                hist = self._clean_for_history(pend_reply)
+                async with self._lock:
+                    self.conversation_history.append(
+                        {"role": "assistant", "content": hist or pend_reply[:120]}
+                    )
+                    self.memory.add_message(
+                        "assistant", hist or pend_reply[:120], character=active_character()
+                    )
+                return
+        except Exception as e:
+            logger.error(f"pending affirm: {e}")
+
+        try:
+            bare = await self._try_bare_find_from_context(user_message)
+            if bare:
+                yield bare
+                hist = self._clean_for_history(bare)
+                async with self._lock:
+                    self.conversation_history.append(
+                        {"role": "assistant", "content": hist or bare[:120]}
+                    )
+                    self.memory.add_message(
+                        "assistant", hist or bare[:120], character=active_character()
+                    )
+                return
+        except Exception as e:
+            logger.error(f"bare find: {e}")
 
         # Активность + настроение (единый источник)
         self.context.touch_activity()
@@ -585,6 +639,33 @@ class LMAssistant:
         except Exception as e:
             logger.error(f"screen_watch: {e}")
 
+        # «проанализируй его/скрин» → последний скриншот + vision
+        try:
+            if not image_path and self._wants_analyze_last_shot(
+                user_message if isinstance(user_message, str) else ""
+            ):
+                last = self._last_screenshot_path()
+                if last and os.path.isfile(last):
+                    image_path = last
+                    look_screen = True
+                    print(f"[DEBUG] analyze last screenshot -> {last}", flush=True)
+                    try:
+                        from screen_watch import VISION_ADDON as _VA
+                        mood_addon = (mood_addon or "") + _VA
+                        mood_addon += (
+                            "\nЭто ПОСЛЕДНИЙ сохранённый скриншот пользователя. "
+                            "Опиши РЕАЛЬНО то, что на картинке (окна, сайты, текст), "
+                            "не выдумывай рабочий стол."
+                        )
+                    except Exception:
+                        pass
+                else:
+                    print("[DEBUG] analyze requested but no screenshot file", flush=True)
+        except Exception as e:
+            logger.error(f"last shot analyze: {e}")
+
+
+
         # ===== МОДУЛЬНЫЙ SYSTEM PROMPT =====
         if HAS_PROMPT_BUILDER and build_system_prompt:
             system_prompt = build_system_prompt(
@@ -659,20 +740,70 @@ class LMAssistant:
 
         async with api_semaphore:
             async with aiohttp.ClientSession() as session:
-                use_model = self.model_name
+                # Всегда актуальная модель из config (после смены в GUI)
+                use_model = (
+                    getattr(config, "MODEL_NAME", None)
+                    or self.model_name
+                )
                 if image_path or look_screen:
                     use_model = (
                         getattr(config, "SCREEN_VISION_MODEL", None)
                         or getattr(config, "FAST_MODEL", None)
+                        or getattr(config, "MODEL_NAME", None)
                         or self.model_name
                     )
+                # Развёрнутый ответ по просьбе хозяина
+                req_tokens = int(self.max_tokens or getattr(config, "MAX_TOKENS", 1000) or 1000)
+                detail = False
+                try:
+                    detail = self._wants_detailed(
+                        user_message if isinstance(user_message, str) else ""
+                    )
+                except Exception:
+                    detail = False
+                if detail:
+                    boost = int(getattr(config, "DETAIL_MAX_TOKENS", 4000) or 4000)
+                    req_tokens = max(req_tokens, boost)
+                    # Дописываем в system, если ещё нет
+                    if messages and messages[0].get("role") == "system":
+                        add = (
+                            "\n\n[РЕЖИМ ПОДРОБНОГО ОТВЕТА] Хозяин просит раскрыть тему. "
+                            "Отвечай развёрнуто, структурировано, без урезания до 1–2 фраз. "
+                            "Можно списки, абзацы, примеры. Сохраняй характер персонажа и тег [ANIM:…] в начале."
+                        )
+                        messages[0]["content"] = (messages[0].get("content") or "") + add
+                think_on = False
+                try:
+                    um = user_message if isinstance(user_message, str) else ""
+                    # составные PC-команды: не держим thinking, если нет явного «подробно»
+                    pc_heavy = bool(re.search(
+                        r"(?i)(открой|запусти|скриншот|сверни|выключи)",
+                        um,
+                    ))
+                    think_on = self._should_enable_thinking(um, detail=detail)
+                    if pc_heavy and not detail and not re.search(
+                        r"(?i)(подробн|раскрыт|разбери код|как работает)",
+                        um,
+                    ):
+                        # «проанализируй скрин» — лёгкий thinking; «открой+скрин» — off
+                        if re.search(r"(?i)проанализир", um) and re.search(r"(?i)скрин", um):
+                            think_on = True
+                        elif pc_heavy and re.search(r"(?i)(открой|запусти|найд|нади)", um):
+                            think_on = False
+                except Exception as e:
+                    logger.debug("thinking decide: %s", e)
+                print(
+                    f"[DEBUG] LLM model={use_model!r} tokens={req_tokens} thinking={think_on}",
+                    flush=True,
+                )
                 payload = {
                     "model": use_model,
                     "messages": messages,
                     "temperature": self.temperature,
-                    "max_tokens": self.max_tokens,
+                    "max_tokens": req_tokens,
                     "stream": True,
                 }
+                payload = self._apply_thinking_to_payload(payload, think_on)
                 try:
                     async with session.post(
                         f"{self.api_url}/chat/completions",
@@ -736,7 +867,9 @@ class LMAssistant:
                                 )
 
                             # ===== ОБРАБОТКА КОМАНД ПАМЯТИ =====
+                            full_response = self._strip_thinking_blocks(full_response)
                             await self._process_memory_commands(full_response)
+                            self._remember_pending_from_reply(full_response)
 
                             # Команды — ТОЛЬКО через executor
                             user_q = self._extract_user_search_query(
@@ -817,11 +950,36 @@ class LMAssistant:
                                     log_system("LAUNCH", result)
                                 launched = True
 
-                            # Второй поиск отключён: явный «найди» уже ушёл в handle_user.
+                            # Fallback: LLM пообещал поиск без [SEARCH] — открываем сами
                             if user_q and not search_done and not look_screen:
-                                logger.info(
-                                    f"🔍 search tag пропущен (нет явной команды в этом ходе): {user_q!r}"
+                                need = bool(
+                                    re.search(
+                                        r"(?i)(найд|нади|поищ|погод|посмотр|гугл|интернет|"
+                                        r"сан\s*франц|килимандж|погода)",
+                                        user_message or "",
+                                    )
                                 )
+                                if need or re.search(
+                                    r"(?i)\[SEARCH|ищу|поиск|погод",
+                                    full_response or "",
+                                ):
+                                    q = user_q
+                                    if re.search(r"(?i)погод", user_message or ""):
+                                        q = user_q if "погод" in user_q.lower() else f"погода {user_q}"
+                                    print(
+                                        f"[DEBUG] fallback SEARCH -> {q!r}",
+                                        flush=True,
+                                    )
+                                    result = await self.executor.execute_async(
+                                        {"type": "SEARCH", "params": q}
+                                    )
+                                    if result:
+                                        log_system("SEARCH", result)
+                                        search_done = True
+                                else:
+                                    logger.info(
+                                        f"🔍 search tag пропущен: {user_q!r}"
+                                    )
 
                 except asyncio.TimeoutError:
                     yield "⏰ Таймаут соединения с API"
@@ -886,10 +1044,20 @@ class LMAssistant:
             key = f"user_{category}_{value[:30]}"
             
             # Сохраняем в память
+            cat = category
+            val = value
+            # Ссылки: если просят не открывать или категория ссылка — blocked_url
+            if re.search(r"https?://", val, re.I) and cat in (
+                "ссылка", "link", "url", "blocked_url", "no_open", "prefer"
+            ):
+                cat = "blocked_url"
+                if "no_open" not in val.lower() and "не откры" not in val.lower():
+                    val = f"{val} | no_open"
+                key = re.sub(r"\s+", " ", val)[:120]
             self.persistent_memory.add_memory(
-                scope_for_category(category), category, key, value, confidence=0.8
+                scope_for_category(cat), cat, key, val, confidence=0.8
             )
-            logger.info(f"Запомнено: {category} → {value[:50]}")
+            logger.info(f"Запомнено: {cat} → {val[:50]}")
             
             # ===== ЕСЛИ ЭТО ПРОГРАММА — ДОБАВЛЯЕМ В АЛИАСЫ =====
             if category in ("app", "программа", "program", "софт", "приложение"):
@@ -1011,6 +1179,42 @@ class LMAssistant:
         """В историю и в модель — короткая реплика. Система/OCR не пишем сюда."""
         return clean_reply(text, limit=limit)
 
+
+    def _remember_blocked_url_from_user(self, user_message: str) -> bool:
+        """«запомни ссылку X и не открывай» / «не открывай эту ссылку»."""
+        if not user_message or not getattr(self, "persistent_memory", None):
+            return False
+        text = user_message.strip()
+        url_m = re.search(r"(https?://\S+)", text, flags=re.I)
+        no_open = bool(re.search(
+            r"(?i)(не\s+открыва\w*|не\s+откры\w*|без\s+открыт\w*|не\s+заходи|не\s+переходи|"
+            r"don'?t\s+open|do\s+not\s+open|never\s+open)",
+            text,
+        ))
+        remember = bool(re.search(r"(?i)(запомни|remember|сохрани)", text))
+        if not url_m:
+            return False
+        if not (no_open or remember):
+            return False
+        url = url_m.group(1).rstrip(").,;»'\"")
+        try:
+            from memory_scope import scope_for_category
+            key = url.lower().split("?", 1)[0].rstrip("/")
+            val = f"{url} | no_open"
+            self.persistent_memory.add_memory(
+                scope_for_category("blocked_url"),
+                "blocked_url",
+                key[:120],
+                val,
+                confidence=0.95,
+            )
+            logger.info(f"🔗 blocked_url запомнен: {url}")
+            return True
+        except Exception as e:
+            logger.error(f"blocked_url remember: {e}")
+            return False
+
+
     def _maybe_store_user_facts(self, user_message: str):
         """Только явные факты, не весь чат."""
         if not user_message or not getattr(self, "persistent_memory", None):
@@ -1040,6 +1244,368 @@ class LMAssistant:
                 logger.info(f"Persistent fact: {cat}/{key}={val[:50]}")
             except Exception as e:
                 logger.warning(f"fact store: {e}")
+
+
+    _AFFIRM_RE = re.compile(
+        r"(?i)^\s*("
+        r"да|даа|да+|ага|угу|ок|окей|okay|yes|yep|lf|лф|"
+        r"давай|давайте|давай\s+да|хорошо|хорошая\s+идея|супер|го|погнали|"
+        r"согласен|согласна|можно|да\s+можно|да\s+открой|да\s+найди|"
+        r"да\s+давай|ну\s+давай|давай\s+найд\w*|давай\s+открой"
+        r")\s*[.!?…]*\s*$"
+    )
+
+    def _is_affirmative(self, text: str) -> bool:
+        t = (text or "").strip()
+        if not t or len(t) > 80:
+            return False
+        return bool(self._AFFIRM_RE.match(t))
+
+    def _extract_pending_from_reply(self, reply: str) -> Optional[Dict[str, Any]]:
+        """Из ответа ассистента: предложение найти / открыть → pending."""
+        if not reply:
+            return None
+        r = reply
+        # Явные теги имеют приоритет — их уже исполнят; pending не нужен
+        if re.search(r"\[SEARCH\s|\[LAUNCH\s|\[OPEN\s", r, re.I):
+            return None
+        # «могу найти / найти в интернете / поискать …»
+        m = re.search(
+            r"(?i)(?:могу\s+)?(?:найти|поискать|погуглить|нади|посмотреть(?:\s+в\s+интернете)?)\s+"
+            r"(?:в\s+интернете\s+|в\s+сети\s+|тебе\s+)?"
+            r"(.{3,120}?)(?:\?|$|\.|,|или|либо)",
+            r,
+        )
+        if m:
+            q = re.sub(r"\s+", " ", m.group(1)).strip(" «»\"'")
+            q = re.sub(r"(?i)^(это|то|вот|тебе)\s+", "", q).strip()
+            if len(q) >= 3:
+                return {"type": "SEARCH", "params": q, "summary": f"поиск: {q}"}
+        # «открыть / запустить X»
+        m = re.search(
+            r"(?i)(?:могу\s+)?(?:открыть|запустить|открыть\s+на\s+пк)\s+"
+            r"(.{2,80}?)(?:\?|$|\.|,|или)",
+            r,
+        )
+        if m:
+            target = re.sub(r"\s+", " ", m.group(1)).strip(" «»\"'")
+            if len(target) >= 2:
+                return {"type": "LAUNCH", "params": target, "summary": f"открыть: {target}"}
+        # «лежит / есть на диске / в папке»
+        m = re.search(
+            r"(?i)(?:лежит|есть|хранится)\s+(?:у\s+тебя\s+)?(?:на\s+пк|на\s+диске|в\s+папке)\s*"
+            r"(.{0,80}?)(?:\?|$|\.)",
+            r,
+        )
+        if m:
+            hint = (m.group(1) or "").strip()
+            return {
+                "type": "LAUNCH",
+                "params": hint or "explorer",
+                "summary": f"открыть на ПК: {hint or 'папка'}",
+                "from_disk": True,
+            }
+        return None
+
+    def _pending_memory_key(self) -> str:
+        try:
+            from memory_scope import active_character
+            who = active_character()
+        except Exception:
+            who = getattr(__import__("config"), "ACTIVE_CHARACTER", "лисичка")
+        return f"pending_offer:{who}"
+
+    def _save_pending_to_memory(self, pend: dict) -> None:
+        """Пишем оффер в память персонажа (persistent_memory)."""
+        self._pending_action = pend
+        if not pend or not getattr(self, "persistent_memory", None):
+            return
+        try:
+            from memory_scope import character_scope
+            import json
+            key = self._pending_memory_key()
+            val = json.dumps(pend, ensure_ascii=False)
+            self.persistent_memory.add_memory(
+                character_scope(),
+                "pending_offer",
+                key,
+                val,
+                confidence=0.9,
+            )
+            print(f"[DEBUG] pending saved to character memory: {pend}", flush=True)
+        except Exception as e:
+            logger.warning(f"pending save: {e}")
+
+    def _load_pending_from_memory(self) -> Optional[Dict[str, Any]]:
+        """Читаем оффер из памяти текущего персонажа."""
+        if self._pending_action:
+            return self._pending_action
+        if not getattr(self, "persistent_memory", None):
+            return None
+        try:
+            from memory_scope import character_scope
+            import json
+            key = self._pending_memory_key()
+            row = self.persistent_memory.get_memory(
+                character_scope(), "pending_offer", key
+            )
+            if not row:
+                return None
+            if isinstance(row, dict):
+                val = row.get("value")
+            elif isinstance(row, (tuple, list)):
+                val = row[0]
+            else:
+                val = row
+            if not val or not str(val).strip():
+                return None
+            if isinstance(val, str):
+                pend = json.loads(val)
+            else:
+                pend = val
+            if isinstance(pend, dict) and pend.get("type"):
+                self._pending_action = pend
+                return pend
+        except Exception as e:
+            logger.debug(f"pending load: {e}")
+        return None
+
+    def _clear_pending_memory(self) -> None:
+        self._pending_action = None
+        if not getattr(self, "persistent_memory", None):
+            return
+        try:
+            from memory_scope import character_scope
+            key = self._pending_memory_key()
+            # overwrite empty
+            self.persistent_memory.add_memory(
+                character_scope(), "pending_offer", key, "", confidence=0.0
+            )
+        except Exception:
+            pass
+
+    def _remember_pending_from_reply(self, reply: str) -> None:
+        pend = self._extract_pending_from_reply(reply)
+        if pend:
+            self._save_pending_to_memory(pend)
+
+
+    async def _try_execute_pending_affirmation(self, user_message: str) -> Optional[str]:
+        """«да / давай» после оффера → выполнить SEARCH/LAUNCH (с памятью ПК)."""
+        if not self._is_affirmative(user_message):
+            return None
+        pend = self._load_pending_from_memory()
+        if not pend:
+            print("[DEBUG] affirmative but no pending offer in character memory", flush=True)
+            return None
+        kind = (pend.get("type") or "").upper()
+        params = pend.get("params") or ""
+        print(f"[DEBUG] affirm -> execute pending {kind} {params!r}", flush=True)
+
+        # Если открытие на ПК — уточнить путь из памяти
+        if kind in ("LAUNCH", "OPEN") and getattr(self, "persistent_memory", None):
+            try:
+                hits = self.persistent_memory.search_memories(
+                    str(params),
+                    scope=["pc", "user", "global", "project"],
+                    limit=5,
+                ) or []
+                for h in hits:
+                    cat = (h.get("category") or "").lower()
+                    val = (h.get("value") or "").strip()
+                    if cat in ("app_alias", "app", "path", "путь", "программа") and val:
+                        params = val
+                        break
+                    if re.search(r"[A-Za-z]:\\|/", val) and len(val) > 3:
+                        params = val
+                        break
+            except Exception as e:
+                logger.debug("pending memory resolve: %s", e)
+            # AppScanner alias
+            try:
+                sc = getattr(self.executor, "app_scanner", None)
+                if sc and hasattr(sc, "resolve_alias"):
+                    al = sc.resolve_alias(str(params))
+                    if al and al.get("target"):
+                        params = al["target"]
+            except Exception:
+                pass
+
+        cmd = {"type": kind if kind in ("SEARCH", "LAUNCH", "OPEN") else "SEARCH", "params": params}
+        try:
+            result = await self.executor.execute_async(cmd)
+        except Exception as e:
+            logger.error(f"pending execute: {e}")
+            result = f"⚠️ Не вышло: {e}"
+        self._clear_pending_memory()
+        anim = "searching" if cmd["type"] == "SEARCH" else "pointing"
+        text = result or ("Готово." if cmd["type"] != "SEARCH" else f"🔍 {params}")
+        return f"[ANIM:{anim}] {text}"
+
+
+    _BARE_FIND_RE = re.compile(
+        r"(?i)^\s*("
+        r"(?:можешь|сможешь)?\s*(?:пожалуйста\s+)?(?:найти|нади|поискать|погуглить|погугли|загугли)\s*\??|"
+        r"(?:найди|нади|поищи|погугли)\s*(?:это|то|пожалуйста)?\s*\??|"
+        r"(?:да\s+)?(?:найди|нади|поищи)\s*\??"
+        r")\s*$"
+    )
+
+    def _is_bare_find_request(self, text: str) -> bool:
+        return bool(self._BARE_FIND_RE.match((text or "").strip()))
+
+    def _last_substantive_user_query(self) -> str:
+        """Предыдущий содержательный вопрос хозяина (не «да» и не «найди»)."""
+        try:
+            for msg in reversed(self.conversation_history[:-1]):
+                if msg.get("role") != "user":
+                    continue
+                t = str(msg.get("content") or "").strip()
+                if not t:
+                    continue
+                if self._is_affirmative(t) or self._is_bare_find_request(t):
+                    continue
+                if len(t) < 3:
+                    continue
+                return t
+        except Exception:
+            pass
+        return ""
+
+    async def _try_bare_find_from_context(self, user_message: str) -> Optional[str]:
+        """«можешь найти?» / «найди» без темы → поиск по прошлому вопросу."""
+        if not self._is_bare_find_request(user_message):
+            return None
+        topic = self._last_substantive_user_query()
+        if not topic:
+            print("[DEBUG] bare find but no previous topic", flush=True)
+            return None
+        # убрать лишние вежливости из темы
+        q = re.sub(
+            r"(?i)^(скажи|расскажи|какой|какая|какие|что\s+такое)\s+",
+            "",
+            topic,
+        ).strip()
+        if len(q) < 3:
+            q = topic
+        print(f"[DEBUG] bare find -> SEARCH previous topic {q!r}", flush=True)
+        # сохранить как pending на всякий случай
+        try:
+            self._save_pending_to_memory(
+                {"type": "SEARCH", "params": q, "summary": f"поиск: {q}"}
+            )
+        except Exception:
+            self._pending_action = {"type": "SEARCH", "params": q}
+        try:
+            result = await self.executor.execute_async(
+                {"type": "SEARCH", "params": q}
+            )
+        except Exception as e:
+            result = f"⚠️ {e}"
+        self._clear_pending_memory()
+        text = result or f"🔍 {q}"
+        return f"[ANIM:searching] {text}"
+
+
+    _THINK_ON_RE = re.compile(
+        r"(?i)("
+        r"подробн\w*|раскрыт\w*|разв[её]рнут\w*|максимальн\w*|детально|"
+        r"распиши|разжева\w*|проанализир\w*|разбери|почему|как\s+работает|"
+        r"сравни|плюсы\s+и\s+минусы|пошагово|step\s*by\s*step|"
+        r"план\s+|спроектир\w*|архитектур\w*|отлад\w*|debug|"
+        r"напиши\s+код|рефактор|алгоритм|доказат\w*|вычисл\w*|"
+        r"подумай|рассуждай|логическ\w*|сложн\w*\s+вопрос"
+        r")"
+    )
+    _THINK_OFF_RE = re.compile(
+        r"(?i)("
+        r"^(прив|здрав|хай|ку|пока|спокойной)|"
+        r"как\s+дела|что\s+делаешь|скучн|"
+        r"открой|запусти|сверни|выключи|громк|"
+        r"найд|нади|поищи|погод|скрин|"
+        r"люблю|поцелуй|обними|потанцуй|поплачь|"
+        r"^да\s*$|^нет\s*$|давай|ага|угу"
+        r")"
+    )
+
+    def _should_enable_thinking(self, user_message: str, *, detail: bool = False) -> bool:
+        """Thinking ON только когда польза > цена (время/токены)."""
+        # Глобальный ручной режим из config/settings
+        mode = str(getattr(__import__("config"), "THINKING_MODE", "auto") or "auto").lower()
+        if mode in ("off", "0", "false", "no"):
+            return False
+        if mode in ("on", "1", "true", "always"):
+            return True
+        # auto
+        if detail:
+            return True
+        t = (user_message or "").strip()
+        if not t:
+            return False
+        if self._THINK_OFF_RE.search(t) and not self._THINK_ON_RE.search(t):
+            return False
+        if self._THINK_ON_RE.search(t):
+            return True
+        # длинный сложный запрос
+        if len(t) >= 180 and ("?" in t or "как " in t.lower() or "почему" in t.lower()):
+            return True
+        return False
+
+    def _apply_thinking_to_payload(self, payload: dict, enabled: bool) -> dict:
+        """Флаги под LM Studio / Qwen3 / совместимые серверы."""
+        payload = dict(payload)
+        payload["enable_thinking"] = bool(enabled)
+        # частый вариант Qwen3
+        payload["chat_template_kwargs"] = {"enable_thinking": bool(enabled)}
+        if enabled:
+            payload["temperature"] = min(float(payload.get("temperature") or 0.4), 0.7)
+        return payload
+
+
+    @staticmethod
+    def _strip_thinking_blocks(text: str) -> str:
+        """Убрать <think>…</think> / reasoning из ответа в чат."""
+        if not text:
+            return text
+        s = text
+        s = re.sub(r"(?is)<think>.*?</think>", "", s)
+        s = re.sub(r"(?is)<reasoning>.*?</reasoning>", "", s)
+        s = re.sub(r"(?is)</?think>", "", s)
+        return s.strip()
+
+
+    def _last_screenshot_path(self) -> Optional[str]:
+        """Последний файл из screenshots/."""
+        import glob
+        try:
+            d = getattr(config, "SCREENSHOTS_DIR", None) or os.path.join(
+                getattr(config, "DATA_DIR", "."), "files", "screenshots"
+            )
+            if not os.path.isdir(d):
+                d = os.path.join(getattr(config, "DATA_DIR", "."), "screenshots")
+            files = []
+            for ext in ("*.png", "*.jpg", "*.jpeg", "*.webp"):
+                files.extend(glob.glob(os.path.join(d, ext)))
+            if not files:
+                return None
+            files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+            return files[0]
+        except Exception as e:
+            logger.debug("last screenshot: %s", e)
+            return None
+
+    def _wants_analyze_last_shot(self, text: str) -> bool:
+        t = (text or "").strip()
+        if not t:
+            return False
+        if re.search(
+            r"(?i)^(проанализ\\w*|разбери|опиши)\\s*(его|её|это|тот|этот|скрин|скриншот)?\\s*[.!?…]*$",
+            t,
+        ):
+            return True
+        if re.search(r"(?i)проанализ\\w*\\s+(этот\\s+)?(скрин|скриншот|файл)", t):
+            return True
+        return False
 
     def _previous_user_text(self) -> str:
         try:
@@ -1200,6 +1766,15 @@ class LMAssistant:
                     obj.close()
             except Exception as e:
                 logger.warning(f"Ошибка закрытия {name}: {e}")
+        # apps.db (AppScanner) — иначе файл остаётся залоченным
+        try:
+            ex = getattr(self, "executor", None)
+            scanner = getattr(ex, "app_scanner", None) if ex else None
+            if scanner is not None and hasattr(scanner, "close"):
+                scanner.close()
+                print("[DEBUG] AppScanner/apps.db closed", flush=True)
+        except Exception as e:
+            logger.warning(f"AppScanner close: {e}")
         self.analyzer = None
         self.emotional_analyzer = None
         self.anim_selector = None

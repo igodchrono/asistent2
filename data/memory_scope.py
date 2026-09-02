@@ -9,6 +9,7 @@ import config
 SHARED_USER_CATEGORIES = {
     "user", "profile", "имя", "name", "хозяин", "хобби", "интерес",
     "предпочтен", "факт", "fact", "city", "город",
+    "ссылка", "link", "url", "blocked_url", "no_open", "prefer",
 }
 
 SHARED_PC_CATEGORIES = {
@@ -38,3 +39,8 @@ def scope_for_category(category: str) -> str:
 def prompt_scopes(name: str = None) -> List[str]:
     """Что подмешивать в промпт: общие слои + текущий персонаж + legacy global."""
     return ["user", "pc", "project", "global", character_scope(name)]
+
+
+def ui_memory_scopes(name: str = None) -> List[str]:
+    """Скоупы для вкладки «Память»: выбранный персонаж + общие."""
+    return [character_scope(name), "user", "pc", "project", "global"]

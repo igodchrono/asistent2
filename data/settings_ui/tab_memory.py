@@ -11,8 +11,9 @@ class MemoryTabMixin:
         layout = QtWidgets.QVBoxLayout(tab)
 
         info = QtWidgets.QLabel(
-            "Здесь записи из <b>persistent_memory.db</b> — то, что ассистент "
-            "сохранил по «запомни…» и тегам <code>[REMEMBER категория: значение]</code> в ответе."
+            "Память <b>выбранного персонажа</b> + общие слои (user/pc/global). "
+            "Скоуп <code>character:имя</code> — только этот персонаж. "
+            "Ссылки с пометкой «не открывать» хранятся как <code>blocked_url</code>."
         )
         info.setWordWrap(True)
         info.setStyleSheet("color: #aaa; font-size: 11px;")
@@ -36,9 +37,9 @@ class MemoryTabMixin:
         filt.addWidget(refresh)
         layout.addLayout(filt)
 
-        self.memory_table = QtWidgets.QTableWidget(0, 5)
+        self.memory_table = QtWidgets.QTableWidget(0, 6)
         self.memory_table.setHorizontalHeaderLabels(
-            ["ID", "Категория", "Ключ", "Значение", "Обновлено"]
+            ["ID", "Скоуп", "Категория", "Ключ", "Значение", "Обновлено"]
         )
         self.memory_table.horizontalHeader().setStretchLastSection(True)
         self.memory_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
@@ -105,7 +106,40 @@ class MemoryTabMixin:
             self.memory_cat_combo.blockSignals(False)
 
             cat_filter = self.memory_cat_combo.currentData() or None
-            rows = pm.list_all(scope="global", category=cat_filter, limit=300)
+            # Память выбранного персонажа + общие скоупы (user/pc/global)
+            try:
+                from memory_scope import ui_memory_scopes, active_character, character_scope
+                scopes = ui_memory_scopes()
+                who = active_character()
+            except Exception:
+                scopes = None
+                who = getattr(config, "ACTIVE_CHARACTER", "лисичка")
+                character_scope = lambda n=None: f"character:{n or who}"
+
+            if scopes is not None:
+                rows = []
+                seen = set()
+                for sc in scopes:
+                    part = pm.list_all(scope=sc, category=cat_filter, limit=300) or []
+                    for r in part:
+                        rid = r.get("id")
+                        if rid in seen:
+                            continue
+                        seen.add(rid)
+                        rows.append(r)
+                # На случай старых записей без скоупа персонажа
+                more = pm.list_all(scope=None, category=cat_filter, limit=500) or []
+                for r in more:
+                    rid = r.get("id")
+                    if rid in seen:
+                        continue
+                    sc = (r.get("scope") or "")
+                    if sc in (scopes or []) or sc.startswith("character:"):
+                        seen.add(rid)
+                        rows.append(r)
+            else:
+                rows = pm.list_all(scope=None, category=cat_filter, limit=400) or []
+
             q = (self.memory_search_edit.text() or "").strip().lower()
             if q:
                 rows = [
@@ -113,7 +147,22 @@ class MemoryTabMixin:
                     if q in (r.get("key") or "").lower()
                     or q in (r.get("value") or "").lower()
                     or q in (r.get("category") or "").lower()
+                    or q in (r.get("scope") or "").lower()
                 ]
+
+            # Сортируем: сначала character:текущий, потом user/pc, global
+            def _ord(r):
+                sc = r.get("scope") or ""
+                if sc == character_scope(who):
+                    return 0
+                if sc == "user":
+                    return 1
+                if sc in ("pc", "project"):
+                    return 2
+                if sc == "global":
+                    return 3
+                return 4
+            rows.sort(key=_ord)
 
             self.memory_table.setRowCount(0)
             for r in rows:
@@ -121,6 +170,7 @@ class MemoryTabMixin:
                 self.memory_table.insertRow(i)
                 vals = [
                     str(r.get("id", "")),
+                    str(r.get("scope", "")),
                     str(r.get("category", "")),
                     str(r.get("key", ""))[:80],
                     str(r.get("value", ""))[:200],
@@ -135,10 +185,10 @@ class MemoryTabMixin:
             try:
                 st = pm.get_stats()
                 self.memory_stats_label.setText(
-                    f"Показано: {len(rows)}  |  всего в БД: {st}"
+                    f"Персонаж: {who}  |  показано: {len(rows)}  |  всего в БД: {st}"
                 )
             except Exception:
-                self.memory_stats_label.setText(f"Показано: {len(rows)}")
+                self.memory_stats_label.setText(f"Персонаж: {who}  |  показано: {len(rows)}")
         except Exception as e:
             self.memory_stats_label.setText(f"Ошибка: {e}")
         finally:

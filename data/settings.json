@@ -2,6 +2,8 @@
   "API_URL": "http://26.26.15.18:1234/v1",
   "API_KEY": "not-needed",
   "MODEL_NAME": "qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive",
+  "FAST_MODEL": "qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive",
+  "SCREEN_VISION_MODEL": "qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive",
   "TEMPERATURE": 0.4,
   "MAX_TOKENS": 1000,
   "ANIMATION_SPEED": 80,
@@ -49,5 +51,7 @@
   "SHOW_AVATAR": true,
   "SCREEN_ALLOWED_MONITORS": [
     1
-  ]
+  ],
+  "DETAIL_MAX_TOKENS": 4000,
+  "THINKING_MODE": "auto"
 }

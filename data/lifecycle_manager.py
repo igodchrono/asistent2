@@ -63,30 +63,43 @@ class LifecycleManager:
         self._loop = loop
         logger.info("Event loop установлен")
     
+    def restart_background(self):
+        """Остановить и заново запустить greeting/screen с актуальными интервалами."""
+        print("🔄 LifecycleManager: перезапуск фоновых потоков…")
+        try:
+            self.stop()
+        except Exception as e:
+            print(f"⚠️ lifecycle stop: {e}")
+        # Новый stop-event после stop()
+        self._stop_event = threading.Event()
+        self._greeting_thread = None
+        self._screen_thread = None
+        self._monitor_thread = None
+        self.start()
+
     def start(self):
         """Запускает фоновые процессы. Можно вызывать повторно после смены настроек."""
+        if getattr(self, "_stop_event", None) is None or self._stop_event.is_set():
+            self._stop_event = threading.Event()
+
         if getattr(config, 'ENABLE_SYSTEM_MONITOR', False):
             self._start_monitor()
 
         enabled = bool(getattr(config, 'ENABLE_AUTO_GREETING', False))
         alive = bool(self._greeting_thread and self._greeting_thread.is_alive())
         if enabled and not alive:
-            if getattr(self, '_stop_event', None) is not None and self._stop_event.is_set():
-                self._stop_event = threading.Event()
             self._start_greeting()
             print(f"🔄 Авто-сообщения ВКЛ, интервал {getattr(config,'GREETING_INTERVAL_MIN',180)}-{getattr(config,'GREETING_INTERVAL_MAX',420)} сек")
         elif not enabled:
             print("🔄 Авто-сообщения ВЫКЛ (ENABLE_AUTO_GREETING=False) — поток не запущен")
         elif alive:
-            print("🔄 Авто-сообщения: поток уже работает")
+            print("🔄 Авто-сообщения: поток уже работает (вызовите restart_background для смены интервала)")
 
         auto_screen = bool(getattr(config, "SCREEN_VISION_AUTO", False)) and bool(
             getattr(config, "SCREEN_VISION_ENABLED", True)
         )
         screen_alive = bool(self._screen_thread and self._screen_thread.is_alive())
         if auto_screen and not screen_alive:
-            if getattr(self, "_stop_event", None) is not None and self._stop_event.is_set():
-                self._stop_event = threading.Event()
             self._start_screen_watch()
             print(
                 f"👁 Автопросмотр экрана ВКЛ, интервал "
@@ -95,23 +108,29 @@ class LifecycleManager:
         elif not auto_screen:
             print("👁 Автопросмотр экрана ВЫКЛ")
         elif screen_alive:
-            print("👁 Автопросмотр: поток уже работает")
+            print("👁 Автопросмотр: поток уже работает (restart_background для смены интервала)")
 
         logger.info("LifecycleManager запущен (greeting=%s alive=%s)", enabled, alive)
     
     def stop(self):
         """Останавливает все фоновые процессы."""
-        self._stop_event.set()
-        
-        if self._monitor_thread and self._monitor_thread.is_alive():
-            self._monitor_thread.join(timeout=2)
-        
-        if self._greeting_thread and self._greeting_thread.is_alive():
-            self._greeting_thread.join(timeout=2)
-        if self._screen_thread and self._screen_thread.is_alive():
-            self._screen_thread.join(timeout=2)
-        
-        logger.info(f"LifecycleManager остановлен. Статистика: {self.get_stats()}")
+        print("[DEBUG] LifecycleManager.stop()", flush=True)
+        try:
+            self._stop_event.set()
+        except Exception:
+            pass
+        for name in ("_monitor_thread", "_greeting_thread", "_screen_thread"):
+            th = getattr(self, name, None)
+            if th and th.is_alive():
+                try:
+                    th.join(timeout=3)
+                    print(f"[DEBUG] joined {name} alive={th.is_alive()}", flush=True)
+                except Exception as e:
+                    print(f"[DEBUG] join {name}: {e}", flush=True)
+        try:
+            logger.info(f"LifecycleManager остановлен. Статистика: {self.get_stats()}")
+        except Exception:
+            pass
     
     def update_activity(self):
         """Обновляет время последней активности пользователя."""
@@ -186,25 +205,33 @@ class LifecycleManager:
             return
         def greeting_loop():
             last_greeting = 0
-            
-            # Берём интервалы из настроек
-            min_interval = getattr(config, "GREETING_INTERVAL_MIN", 180)
-            max_interval = getattr(config, "GREETING_INTERVAL_MAX", 300)
-            try:
-                from time_context import greeting_interval_factor, time_bucket
-                fac = greeting_interval_factor(time_bucket())
-                min_interval = int(min_interval * fac)
-                max_interval = int(max_interval * fac)
-            except Exception:
-                pass
-            next_interval = random.randint(min_interval, max(min_interval + 1, max_interval))
-            
+            next_interval = 60
+
+            def _read_intervals():
+                mn = int(getattr(config, "GREETING_INTERVAL_MIN", 180) or 180)
+                mx = int(getattr(config, "GREETING_INTERVAL_MAX", 300) or 300)
+                try:
+                    from time_context import greeting_interval_factor, time_bucket
+                    fac = greeting_interval_factor(time_bucket())
+                    mn = max(30, int(mn * fac))
+                    mx = max(mn + 1, int(mx * fac))
+                except Exception:
+                    mx = max(mn + 1, mx)
+                return mn, mx
+
+            min_interval, max_interval = _read_intervals()
+            next_interval = random.randint(min_interval, max_interval)
             logger.info(f"Авто-сообщения: интервал {min_interval}-{max_interval} сек")
-            
+
             while not self._stop_event.is_set():
+                # Интервалы читаем каждый цикл — смена в GUI применяется без перезапуска
+                if not bool(getattr(config, "ENABLE_AUTO_GREETING", False)):
+                    self._stop_event.wait(5)
+                    continue
+                min_interval, max_interval = _read_intervals()
                 now = time.time()
                 silent_for = now - self._last_user_activity
-                
+
                 # Проверяем, пора ли отправлять сообщение
                 if silent_for >= next_interval and (now - last_greeting) >= next_interval:
                     # Определяем настроение
@@ -237,6 +264,7 @@ class LifecycleManager:
                     self._greeting_count += 1
                     
                     last_greeting = now
+                    min_interval, max_interval = _read_intervals()
                     next_interval = random.randint(min_interval, max_interval)
                     
                     # Сбрасываем накопленную обиду после отправки
@@ -255,21 +283,28 @@ class LifecycleManager:
 
         def screen_loop():
             print("👁 поток автопросмотра запущен")
-            first = True
+            # Первый взгляд — тоже после полного интервала (не через 3 сек)
             while not self._stop_event.is_set():
-                interval = 3 if first else max(15, int(getattr(config, "SCREEN_VISION_AUTO_INTERVAL", 60) or 60))
-                first = False
+                raw = getattr(config, "SCREEN_VISION_AUTO_INTERVAL", 60)
+                try:
+                    interval = int(float(raw) or 60)
+                except (TypeError, ValueError):
+                    interval = 60
+                # защита: минимум 60 сек, чтобы слайдер/опечатки не давали «каждые N секунд»
+                interval = max(60, interval)
+                print(f"👁 следующий автопросмотр через {interval} сек (~{interval // 60} мин)")
                 if self._stop_event.wait(interval):
                     break
                 if not getattr(config, "SCREEN_VISION_AUTO", False):
                     continue
                 if not getattr(config, "SCREEN_VISION_ENABLED", True):
                     continue
-                if time.time() - self._last_user_activity < 2:
-                    print("👁 пропуск: хозяин только что писал")
+                # не смотреть, если пользователь недавно писал (30 сек тишины)
+                if time.time() - self._last_user_activity < 30:
+                    print("👁 пропуск: хозяин недавно писал")
                     continue
                 try:
-                    print("👁 смотрю экран…")
+                    print(f"👁 смотрю экран… (интервал был {interval}с)")
                     self._peek_screen()
                 except Exception as e:
                     print(f"👁 ошибка: {e}")
